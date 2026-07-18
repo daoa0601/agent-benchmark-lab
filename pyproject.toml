@@ -1,0 +1,70 @@
+[build-system]
+requires = ["uv_build>=0.9.5,<0.10.0"]
+build-backend = "uv_build"
+
+[project]
+name = "agent-benchmark-lab"
+version = "0.1.0"
+description = "Fresh-start workbench for auditable and reproducible agent benchmarks"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+authors = [{ name = "Anh Dao" }]
+dependencies = [
+  "benchmark-audit-core>=0.1,<0.2",
+]
+
+[project.optional-dependencies]
+telemetry = [
+  "agenttrace-platform>=0.1,<0.2",
+]
+dev = [
+  "basedpyright>=1.28,<2",
+  "pytest>=8.3,<10",
+  "pytest-cov>=6,<8",
+  "ruff>=0.11,<1",
+]
+
+[tool.uv.sources]
+benchmark-audit-core = { path = "../benchmark-audit-core", editable = true }
+agenttrace-platform = { path = "../agent-trace-platform", editable = true }
+
+[project.scripts]
+agent-benchmark = "agent_benchmark_lab.cli:main"
+
+[tool.uv.build-backend]
+module-name = "agent_benchmark_lab"
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers --strict-config"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "N", "UP"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["agent_benchmark_lab", "benchmark_audit_core"]
+
+[tool.basedpyright]
+pythonVersion = "3.11"
+typeCheckingMode = "standard"
+include = ["src", "tests"]
+venvPath = "."
+venv = ".venv"
+reportMissingTypeStubs = false
+reportUnknownMemberType = false
+reportUnknownVariableType = false
+
+[tool.coverage.run]
+branch = true
+source = ["agent_benchmark_lab"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+fail_under = 90

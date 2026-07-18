@@ -1,0 +1,198 @@
+{
+  "schema_version": "1.0.0",
+  "session_id": "example-kernel-session-001",
+  "experiment_id": "example-kernel-study",
+  "run_id": "run-example-001",
+  "episode_id": "episode-example-001",
+  "trace_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "task_id": "systems.kernel-optimization",
+  "task_version": "1.0.0",
+  "generator_id": "optimizer-agent-example",
+  "source_commit": "abcdef1234567890",
+  "source_dirty": false,
+  "benchmark_protocol_version": "kernel-example-v1",
+  "task_definition": {
+    "uri": "object://example/task-definition.yaml",
+    "sha256": "9999999999999999999999999999999999999999999999999999999999999999",
+    "media_type": "application/yaml",
+    "byte_size": 1200
+  },
+  "benchmark_protocol": {
+    "uri": "object://example/benchmark-protocol.md",
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "media_type": "text/markdown",
+    "byte_size": 2400
+  },
+  "started_at": "2026-07-17T08:00:00Z",
+  "ended_at": "2026-07-17T10:00:00Z",
+  "termination_reason": "agent_finished",
+  "hardware": {
+    "accelerator_vendor": "NVIDIA",
+    "accelerator_models": [
+      "H100"
+    ],
+    "accelerator_count": 1,
+    "optimization_scope": "single_device",
+    "host_architecture": "x86_64",
+    "machine_class": "synthetic-example-only",
+    "driver_version": "example-driver",
+    "runtime_versions": {
+      "cuda": "example-runtime"
+    },
+    "observed_evidence": {
+      "uri": "object://example/hardware-inventory.txt",
+      "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+      "media_type": "text/plain",
+      "byte_size": 100
+    }
+  },
+  "session_policy": {
+    "one_task_per_session": true,
+    "termination_policy": "agent_decides",
+    "watchdog_seconds": 86400,
+    "max_turns": null,
+    "live_hardware": true,
+    "required_stages": [
+      "compile",
+      "check",
+      "benchmark"
+    ],
+    "minimum_benchmark_repetitions": 3
+  },
+  "audit_policy": {
+    "require_clean_source": true,
+    "require_agent_decided_stop": true,
+    "require_independent_reviewer": true,
+    "require_manual_review": true,
+    "require_final_artifact_review": true,
+    "require_full_trace_review": true,
+    "require_task_definition_review": true,
+    "require_benchmark_protocol_review": true,
+    "required_retests": [
+      "fresh_process",
+      "cold_cache",
+      "input_perturbation",
+      "output_validation"
+    ],
+    "blocking_severities": [
+      "critical",
+      "high"
+    ]
+  },
+  "stage_counts": {
+    "compile": 4,
+    "check": 4,
+    "benchmark": 10
+  },
+  "benchmark_repetitions": 10,
+  "full_trace": {
+    "uri": "object://example/full-trace.jsonl.zst",
+    "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+    "media_type": "application/zstd",
+    "byte_size": 1000
+  },
+  "final_artifact": {
+    "uri": "object://example/final-kernel.py",
+    "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+    "media_type": "text/x-python",
+    "byte_size": 500
+  },
+  "claims": [
+    {
+      "claim_id": "latency-main",
+      "metric_name": "median latency",
+      "value": 12.5,
+      "unit": "microseconds",
+      "aggregation": "median of 10 randomized repetitions",
+      "headline": true,
+      "baseline_value": 20.0,
+      "evidence": [
+        {
+          "uri": "object://example/benchmark-samples.json",
+          "sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+          "media_type": "application/json",
+          "byte_size": 750
+        }
+      ]
+    }
+  ],
+  "audit": {
+    "audit_id": "audit-example-001",
+    "auditor_id": "review-agent-example",
+    "auditor_kind": "hybrid",
+    "independent": true,
+    "manual_review_completed": true,
+    "reviewed_final_artifact": true,
+    "reviewed_full_trace": true,
+    "reviewed_task_definition": true,
+    "reviewed_benchmark_protocol": true,
+    "retests": [
+      {
+        "retest_id": "retest-fresh-process",
+        "category": "fresh_process",
+        "outcome": "passed",
+        "isolated_from_original_session": true,
+        "evidence": [
+          {
+            "uri": "object://example/retest-fresh-process.json",
+            "sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+            "media_type": "application/json",
+            "byte_size": 200
+          }
+        ],
+        "notes": "Synthetic example only."
+      },
+      {
+        "retest_id": "retest-cold-cache",
+        "category": "cold_cache",
+        "outcome": "passed",
+        "isolated_from_original_session": true,
+        "evidence": [
+          {
+            "uri": "object://example/retest-cold-cache.json",
+            "sha256": "6666666666666666666666666666666666666666666666666666666666666666",
+            "media_type": "application/json",
+            "byte_size": 200
+          }
+        ],
+        "notes": "Synthetic example only."
+      },
+      {
+        "retest_id": "retest-input-perturbation",
+        "category": "input_perturbation",
+        "outcome": "passed",
+        "isolated_from_original_session": true,
+        "evidence": [
+          {
+            "uri": "object://example/retest-input-perturbation.json",
+            "sha256": "7777777777777777777777777777777777777777777777777777777777777777",
+            "media_type": "application/json",
+            "byte_size": 200
+          }
+        ],
+        "notes": "Synthetic example only."
+      },
+      {
+        "retest_id": "retest-output-validation",
+        "category": "output_validation",
+        "outcome": "passed",
+        "isolated_from_original_session": true,
+        "evidence": [
+          {
+            "uri": "object://example/retest-output-validation.json",
+            "sha256": "8888888888888888888888888888888888888888888888888888888888888888",
+            "media_type": "application/json",
+            "byte_size": 200
+          }
+        ],
+        "notes": "Synthetic example only."
+      }
+    ],
+    "findings": [],
+    "verdict": "pass",
+    "completed_at": "2026-07-17T10:30:00Z"
+  },
+  "attributes": {
+    "synthetic_example": true
+  }
+}
