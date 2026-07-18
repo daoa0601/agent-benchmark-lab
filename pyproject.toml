@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "agent-benchmark-lab"
-version = "0.1.0"
+version = "0.1.1"
 description = "Fresh-start workbench for auditable and reproducible agent benchmarks"
 readme = "README.md"
 license = "MIT"

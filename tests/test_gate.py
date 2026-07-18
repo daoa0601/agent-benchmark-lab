@@ -23,7 +23,13 @@ def test_synthetic_example_passes_and_renders_findings(tmp_path: Path) -> None:
     assert "## Audit findings" in report.read_text(encoding="utf-8")
 
 
-def test_agenttrace_is_loaded_only_when_persistence_is_requested(tmp_path: Path) -> None:
+def test_agenttrace_is_loaded_only_when_persistence_is_requested(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def missing_module(name: str) -> object:
+        raise ImportError(name)
+
+    monkeypatch.setattr("agent_benchmark_lab.gate.import_module", missing_module)
     with pytest.raises(RuntimeError, match="agenttrace-platform"):
         gate_session(
             PROJECT_ROOT / "examples/auditable-session.example.json",

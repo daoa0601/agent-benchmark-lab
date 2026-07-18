@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import threading
 import time
@@ -85,7 +86,14 @@ class JsonlTraceSink:
         if self.path.is_symlink():
             raise ValueError("trace path must not be a symbolic link")
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._file: TextIO = self.path.open("a", encoding="utf-8")
+        flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(self.path, flags, 0o600)
+        try:
+            self._file: TextIO = os.fdopen(descriptor, "a", encoding="utf-8")
+        except Exception:
+            os.close(descriptor)
+            raise
         self._bytes_written = self.path.stat().st_size
         self._max_file_bytes = max_file_bytes
         self._lock = threading.Lock()
