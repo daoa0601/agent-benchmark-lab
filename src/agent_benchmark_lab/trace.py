@@ -1,10 +1,9 @@
-"""Bounded JSONL trace capture with field-level secret and private-reasoning removal."""
+"""Bounded JSONL trace capture using AgentTrace's secret and private-reasoning redaction rules."""
 
 from __future__ import annotations
 
 import json
 import os
-import re
 import threading
 import time
 from collections.abc import Mapping, Sequence
@@ -12,25 +11,10 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any, TextIO
 
+from agenttrace.redaction import PRIVATE_REASONING_KEYS, SECRET_KEYS, SECRET_PATTERNS
+
 _FIELD_CAP = 8 * 1024
 _DEFAULT_FILE_CAP = 50 * 1024 * 1024
-_SECRET_KEYS = {
-    "api_key",
-    "apikey",
-    "authorization",
-    "cookie",
-    "credentials",
-    "password",
-    "private_key",
-    "secret",
-    "secret_key",
-    "session_cookie",
-}
-_PRIVATE_REASONING_KEYS = {"chain_of_thought", "private_reasoning", "reasoning_content"}
-_SECRET_PATTERNS = (
-    re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"),
-    re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{12,}"),
-)
 
 
 class TraceOverflowError(RuntimeError):
@@ -41,9 +25,9 @@ def sanitize_trace_value(value: Any, *, key: str | None = None) -> tuple[Any, bo
     """Return a JSON-safe value and whether it was redacted, truncated, or coerced."""
 
     normalized = key.casefold() if key else None
-    if normalized in _SECRET_KEYS:
+    if normalized in SECRET_KEYS:
         return "[REDACTED_SECRET]", True
-    if normalized in _PRIVATE_REASONING_KEYS:
+    if normalized in PRIVATE_REASONING_KEYS:
         return "[PRIVATE_REASONING_REMOVED]", True
     if isinstance(value, Mapping):
         output: dict[str, Any] = {}
@@ -67,7 +51,7 @@ def sanitize_trace_value(value: Any, *, key: str | None = None) -> tuple[Any, bo
     if isinstance(value, str):
         cleaned = value[:_FIELD_CAP]
         changed = len(value) > _FIELD_CAP
-        for pattern in _SECRET_PATTERNS:
+        for pattern in SECRET_PATTERNS:
             cleaned, replacements = pattern.subn("[REDACTED_SECRET]", cleaned)
             changed = changed or replacements > 0
         return cleaned, changed

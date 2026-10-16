@@ -1,4 +1,4 @@
-.PHONY: sync format lint typecheck test check build
+.PHONY: sync format lint typecheck test check
 
 sync:
 	uv sync --extra dev
@@ -18,6 +18,3 @@ test:
 	uv run pytest --cov=agent_benchmark_lab --cov-report=term-missing
 
 check: lint typecheck test
-
-build:
-	uv build
