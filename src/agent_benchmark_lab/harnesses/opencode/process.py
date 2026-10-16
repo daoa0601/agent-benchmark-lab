@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import signal
@@ -108,6 +109,11 @@ def run_opencode(
         except subprocess.TimeoutExpired:
             os.killpg(process.pid, signal.SIGKILL)
             stdout, stderr = process.communicate()
+    finally:
+        # Even after a clean exit, a detached background child may still be in the group; nothing
+        # the agent started may outlive its sample or its workspace.
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(process.pid, signal.SIGKILL)
     return OpenCodeProcessResult(
         argv=argv,
         exit_code=124 if timed_out else process.returncode,

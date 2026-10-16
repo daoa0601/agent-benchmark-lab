@@ -76,6 +76,9 @@ class OpenCodeBenchmarkRecord(StrictModel):
     output_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     output_bytes: int | None = Field(default=None, ge=0)
     output_ref: str | None = None
+    # The evaluators score the answer before redaction; this commits to it without retaining it.
+    scored_output_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    scored_output_bytes: int | None = Field(default=None, ge=0)
     broker_requests: list[BrokerRequestEvidence]
     workspace_changes: list[WorkspaceChange]
     evaluations: list[BenchmarkEvaluation] = Field(default_factory=list)

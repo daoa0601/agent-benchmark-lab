@@ -5,8 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Sequence
+from enum import Enum
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, TypeVar
 
 import typer
 from pydantic import BaseModel, ValidationError
@@ -14,7 +15,7 @@ from pydantic import BaseModel, ValidationError
 from agent_benchmark_lab.evidence import describe_evidence
 from agent_benchmark_lab.gate import gate_session
 from agenttrace.storage import FileObjectStore
-from agenttrace.tasks import TaskDefinition, describe_validation_error, load_task
+from agenttrace.tasks import TaskDefinition, TaskSample, describe_validation_error, load_task
 
 app = typer.Typer(
     name="agent-benchmark",
@@ -35,16 +36,35 @@ def _invalid(error: Exception) -> typer.Exit:
     return typer.Exit(code=1)
 
 
+EnumT = TypeVar("EnumT", bound=Enum)
+
+# Models whose Pydantic errors loaders wrap, keyed by the error title they produce.
+_VALIDATED_MODELS: dict[str, type[BaseModel]] = {
+    model.__name__: model for model in (TaskDefinition, TaskSample)
+}
+
+
 def _bad_parameter(error: ValueError, model: type[BaseModel] | None = None) -> typer.BadParameter:
-    """Report invalid input by field and rule; Pydantic's own text quotes the offending values.
+    """Report invalid input by field and rule; exception text can quote the offending values.
 
     ``model`` names the fields that may appear in the location; other location parts are masked.
+    A loader error wrapping a Pydantic error is described the same way, and any other error by
+    type only.
     """
-    if isinstance(error, ValidationError):
-        return typer.BadParameter(
-            f"{error.title}: {describe_validation_error(error, model)}",
-        )
-    return typer.BadParameter(str(error))
+    cause = error if isinstance(error, ValidationError) else error.__cause__
+    if isinstance(cause, ValidationError):
+        cause_model = _VALIDATED_MODELS.get(cause.title, model)
+        return typer.BadParameter(f"{cause.title}: {describe_validation_error(cause, cause_model)}")
+    return typer.BadParameter(f"invalid input ({type(error).__name__})")
+
+
+def _choice(kind: type[EnumT], value: str, option: str) -> EnumT:
+    """Parse an option value, naming the allowed values rather than echoing the given one."""
+    try:
+        return kind(value)
+    except ValueError as error:
+        allowed = ", ".join(str(member.value) for member in kind)
+        raise typer.BadParameter(f"{option} must be one of: {allowed}") from error
 
 
 @app.command()
@@ -141,9 +161,9 @@ def zai_api_benchmark(
     from agenttrace.tasks import load_task_samples
 
     try:
-        capture = CaptureMode(capture_content)
-        thinking = ZAIThinkingMode(thinking_mode)
-        effort = ZAIReasoningEffort(reasoning_effort)
+        capture = _choice(CaptureMode, capture_content, "--capture-content")
+        thinking = _choice(ZAIThinkingMode, thinking_mode, "--thinking-mode")
+        effort = _choice(ZAIReasoningEffort, reasoning_effort, "--reasoning-effort")
         task = load_task(task_path)
         samples = load_task_samples(samples_path)
     except ValueError as error:
@@ -300,8 +320,8 @@ def zai_opencode_benchmark(
     from agenttrace.tasks import load_task_samples
 
     try:
-        capture = CaptureMode(capture_content)
-        effort = ZAIReasoningEffort(reasoning_effort)
+        capture = _choice(CaptureMode, capture_content, "--capture-content")
+        effort = _choice(ZAIReasoningEffort, reasoning_effort, "--reasoning-effort")
         task = load_task(task_path)
         samples = load_task_samples(samples_path)
         if watchdog_seconds is None:
@@ -428,10 +448,10 @@ def zai_smoke(
     from agenttrace.integrations import CaptureMode, TelemetrySettings, create_telemetry
 
     try:
-        plan = ZAIEndpointPlan(endpoint_plan)
-        capture = CaptureMode(capture_content)
-        thinking = ZAIThinkingMode(thinking_mode)
-        effort = ZAIReasoningEffort(reasoning_effort)
+        plan = _choice(ZAIEndpointPlan, endpoint_plan, "--endpoint-plan")
+        capture = _choice(CaptureMode, capture_content, "--capture-content")
+        thinking = _choice(ZAIThinkingMode, thinking_mode, "--thinking-mode")
+        effort = _choice(ZAIReasoningEffort, reasoning_effort, "--reasoning-effort")
     except ValueError as error:
         raise _bad_parameter(error) from error
     if plan == ZAIEndpointPlan.CODING:

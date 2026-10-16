@@ -4,16 +4,22 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
+import subprocess
 from collections.abc import Callable
+from contextlib import ExitStack
 from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import cast
 
 import httpx
-from pydantic import JsonValue
+from pydantic import JsonValue, SecretStr
 
-from agent_benchmark_lab.benchmarks.evaluation import evaluate_response
+from agent_benchmark_lab.benchmarks.evaluation import (
+    evaluate_response,
+    validate_evaluator_configs,
+)
 from agent_benchmark_lab.harnesses.opencode.artifacts import persist_bytes, persist_json
 from agent_benchmark_lab.harnesses.opencode.config import (
     build_opencode_config,
@@ -42,7 +48,7 @@ from agent_benchmark_lab.harnesses.opencode.workspace import (
 from agent_benchmark_lab.providers.zai import ZAIReasoningEffort
 from agenttrace.integrations import TelemetryRuntime
 from agenttrace.models import TokenUsage
-from agenttrace.storage import ObjectStore
+from agenttrace.storage import FileObjectStore, ObjectStore
 from agenttrace.tasks import TaskDefinition, TaskSample, digest_json, render_task_prompt
 
 ProcessRunner = Callable[..., OpenCodeProcessResult]
@@ -70,6 +76,22 @@ def _agent_prompt(task: TaskDefinition, sample: TaskSample) -> str:
         "the task is complete. Return a concise final answer when finished.\n\n"
         f"{task_prompt}"
     )
+
+
+def opencode_identity(executable: str) -> dict[str, str | None]:
+    """The resolved OpenCode binary's SHA-256 and reported version, which change run behavior."""
+    resolved = shutil.which(executable)
+    if resolved is None:
+        return {"sha256": None, "version": None}
+    path = Path(resolved).resolve()
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    try:
+        reported = subprocess.run(
+            [str(path), "--version"], capture_output=True, text=True, timeout=10, check=False
+        ).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        reported = ""
+    return {"sha256": digest, "version": reported.splitlines()[0][:128] if reported else None}
 
 
 def _sanitize_text(text: str, secrets: tuple[str, ...]) -> bytes:
@@ -114,18 +136,76 @@ def run_opencode_benchmark(
             "the OpenCode harness runs in a local isolated workspace and cannot provision "
             f"environment.kind={task.environment.kind.value}; use environment.kind=none"
         )
+    validate_evaluator_configs(task)
     effective_small_model = small_model or model
     credential = credential_source.resolve()
-    real_key = credential.get_secret_value()
     task_payload = cast(JsonValue, task.model_dump(mode="json"))
     samples_payload = cast(JsonValue, [sample.model_dump(mode="json") for sample in samples])
     task_digest = digest_json(task_payload)
     samples_digest = digest_json(samples_payload)
-    workspace_digest = None
-    if workspace_source is not None:
-        source_snapshot = snapshot_workspace(workspace_source.expanduser().resolve())
-        workspace_digest = _digest(source_snapshot)
+    identity = opencode_identity(executable)
+    with ExitStack() as stack:
+        # One frozen copy of the source serves every sample, so artifacts written during the run
+        # (an output root inside the source, for example) never reach a later sample, and every
+        # sample's workspace matches the recorded digest.
+        frozen_source = None
+        workspace_digest = None
+        if workspace_source is not None:
+            excluded = (objects.root,) if isinstance(objects, FileObjectStore) else ()
+            frozen = stack.enter_context(isolated_workspace(workspace_source, exclude=excluded))
+            frozen_source = frozen.path
+            workspace_digest = _digest(snapshot_workspace(frozen_source))
+        execution = _run_samples(
+            task=task,
+            samples=samples,
+            telemetry=telemetry,
+            objects=objects,
+            experiment_id=experiment_id,
+            session_id=session_id,
+            frozen_source=frozen_source,
+            workspace_digest=workspace_digest,
+            identity=identity,
+            credential=credential,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            small_model=effective_small_model,
+            executable=executable,
+            timeout_seconds=timeout_seconds,
+            max_model_calls=max_model_calls,
+            store_outputs=store_outputs,
+            process_runner=process_runner,
+            broker_http_client=broker_http_client,
+            task_digest=task_digest,
+            samples_digest=samples_digest,
+        )
+    return execution
 
+
+def _run_samples(
+    *,
+    task: TaskDefinition,
+    samples: list[TaskSample],
+    telemetry: TelemetryRuntime,
+    objects: ObjectStore,
+    experiment_id: str,
+    session_id: str | None,
+    frozen_source: Path | None,
+    workspace_digest: str | None,
+    identity: dict[str, str | None],
+    credential: SecretStr,
+    model: str,
+    reasoning_effort: ZAIReasoningEffort,
+    small_model: str,
+    executable: str,
+    timeout_seconds: int | None,
+    max_model_calls: int,
+    store_outputs: bool,
+    process_runner: ProcessRunner,
+    broker_http_client: httpx.Client | None,
+    task_digest: str,
+    samples_digest: str,
+) -> OpenCodeBenchmarkExecution:
+    real_key = credential.get_secret_value()
     records: list[OpenCodeBenchmarkRecord] = []
     refs: list[OpenCodeRecordRef] = []
     for sample in samples:
@@ -136,11 +216,14 @@ def run_opencode_benchmark(
             {
                 "schema": "agenttrace-opencode-v1",
                 "model": model,
-                "small_model": effective_small_model,
+                "small_model": small_model,
                 "reasoning_effort": reasoning_effort.value,
                 "prompt_sha256": prompt_sha256,
                 "max_model_calls": max_model_calls,
                 "workspace_digest": workspace_digest,
+                "timeout_seconds": timeout_seconds,
+                "opencode_sha256": identity["sha256"],
+                "opencode_version": identity["version"],
             }
         )
         started_at = _utc_now()
@@ -159,10 +242,13 @@ def run_opencode_benchmark(
                 "agenttrace.provider.thinking_mode": "enabled",
                 "agenttrace.provider.reasoning_effort": reasoning_effort.value,
                 "agenttrace.provenance.config_digest": config_digest,
+                "agenttrace.opencode.version": identity["version"] or "unknown",
+                "agenttrace.opencode.sha256": identity["sha256"] or "unknown",
+                "agenttrace.process.timeout_seconds": timeout_seconds or 0,
                 "agenttrace.session.task_count": 1,
             },
         )
-        with isolated_workspace(workspace_source) as workspace:
+        with isolated_workspace(frozen_source) as workspace:
             before = snapshot_workspace(workspace.path)
             with TemporaryDirectory(prefix="agenttrace-opencode-runtime-") as runtime_dir:
                 runtime_root = Path(runtime_dir)
@@ -176,7 +262,7 @@ def run_opencode_benchmark(
                     config = build_opencode_config(
                         prompt=prompt,
                         model=model,
-                        small_model=effective_small_model,
+                        small_model=small_model,
                         broker_base_url=broker.base_url,
                         broker_token=broker.client_token,
                         reasoning_effort=reasoning_effort,
@@ -309,6 +395,7 @@ def run_opencode_benchmark(
         stderr_sha256 = hashlib.sha256(stderr).hexdigest()
         final_output = parsed.final_text.encode("utf-8")
         output_sha256 = hashlib.sha256(final_output).hexdigest()
+        scored_output = parsed.answer_text.encode("utf-8")
         output_ref = None
         if store_outputs:
             output_ref, stored_digest = persist_bytes(
@@ -368,6 +455,8 @@ def run_opencode_benchmark(
             output_sha256=output_sha256,
             output_bytes=len(final_output),
             output_ref=output_ref,
+            scored_output_sha256=hashlib.sha256(scored_output).hexdigest(),
+            scored_output_bytes=len(scored_output),
             broker_requests=[
                 BrokerRequestEvidence.from_request(request) for request in broker_requests
             ],

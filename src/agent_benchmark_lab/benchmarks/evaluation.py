@@ -6,6 +6,7 @@ import re
 from typing import cast
 
 import jsonschema
+from jsonschema.validators import validator_for
 from pydantic import JsonValue
 
 from agent_benchmark_lab.benchmarks.models import BenchmarkEvaluation
@@ -27,6 +28,42 @@ SUPPORTED_DIRECT_EVALUATORS = {
 }
 
 
+def validate_evaluator_configs(task: TaskDefinition) -> None:
+    """Reject malformed supported evaluators before any credential is resolved or model called.
+
+    ``TaskDefinition`` accepts free-form evaluator config, so without this a broken regex, budget,
+    or schema would surface only after a billed run.
+    """
+    for spec in task.evaluators:
+        if spec.kind == "regex":
+            pattern = spec.config.get("pattern")
+            if not isinstance(pattern, str):
+                raise ValueError(f"regex evaluator {spec.evaluator_id} requires config.pattern")
+            try:
+                re.compile(pattern)
+            except re.error as error:
+                raise ValueError(
+                    f"regex evaluator {spec.evaluator_id} has an invalid config.pattern"
+                ) from error
+        elif spec.kind == "latency_budget":
+            maximum = spec.config.get("max_latency_ms")
+            if isinstance(maximum, bool) or not isinstance(maximum, int | float) or maximum <= 0:
+                raise ValueError(
+                    f"latency evaluator {spec.evaluator_id} requires positive numeric "
+                    "config.max_latency_ms"
+                )
+        elif spec.kind == "json_schema":
+            schema = spec.config.get("schema", task.expected_output_schema)
+            if not isinstance(schema, dict):
+                raise ValueError(f"json_schema evaluator {spec.evaluator_id} requires a schema")
+            try:
+                validator_for(schema).check_schema(schema)
+            except jsonschema.SchemaError as error:
+                raise ValueError(
+                    f"json_schema evaluator {spec.evaluator_id} has an invalid schema"
+                ) from error
+
+
 def validate_direct_task(task: TaskDefinition) -> None:
     unsupported = [
         spec.evaluator_id
@@ -37,6 +74,7 @@ def validate_direct_task(task: TaskDefinition) -> None:
         raise ValueError(f"direct API runner cannot execute required evaluators: {unsupported}")
     if task.environment.kind.value != "none":
         raise ValueError("direct API runner requires environment.kind=none; use an agent harness")
+    validate_evaluator_configs(task)
 
 
 def _expected(spec: EvaluatorSpec, task: TaskDefinition, sample: TaskSample) -> JsonValue:

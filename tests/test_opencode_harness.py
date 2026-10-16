@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import threading
 from pathlib import Path
+from typing import cast
 
 import httpx
 import pytest
@@ -559,3 +560,245 @@ def test_broker_rejects_a_request_whose_body_arrives_after_drain() -> None:
     assert drained == ()
     assert upstream_calls == []
     assert reply == b"" or reply.split(b" ", 2)[1] == b"503"
+
+
+ROOT = Path(__file__).resolve().parents[1]
+RUN_KEY = "real-coding-secret-123456"
+
+
+def _completed(answer: str = "done") -> OpenCodeProcessResult:
+    events = [
+        {"type": "step_finish", "part": {"tokens": {"input": 1, "output": 1}}},
+        {"type": "text", "part": {"text": answer}},
+    ]
+    return OpenCodeProcessResult(
+        argv=("opencode",),
+        exit_code=0,
+        stdout="\n".join(json.dumps(event) for event in events),
+        stderr="",
+        elapsed_seconds=0.1,
+        timed_out=False,
+    )
+
+
+def _run(tmp_path: Path, task: TaskDefinition, process, **kwargs: object):
+    options: dict[str, object] = {
+        "samples": [TaskSample(sample_id="s1", input={"language": "python", "diff": ""})],
+        "objects": FileObjectStore(tmp_path / "objects"),
+        **kwargs,
+    }
+    return run_opencode_benchmark(
+        task=task,
+        credential_source=ZAICredentialSource(),
+        telemetry=create_telemetry(TelemetrySettings(telemetry_enabled=False)),
+        experiment_id="review-test",
+        process_runner=process,
+        **options,  # type: ignore[arg-type]
+    )
+
+
+def test_later_samples_start_from_the_same_source_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ZAI_API_KEY", RUN_KEY)
+    task = load_task(ROOT / "examples/tasks/code-review.yaml")
+    source = tmp_path / "repo"
+    source.mkdir()
+    (source / "main.py").write_text("value = 1\n")
+    seen: list[list[str]] = []
+
+    def process(**kwargs: object) -> OpenCodeProcessResult:
+        workspace = cast(Path, kwargs["workspace"])
+        seen.append(sorted(path.relative_to(workspace).as_posix() for path in workspace.rglob("*")))
+        return _completed()
+
+    # The default output root lives inside the target repository.
+    _run(
+        tmp_path,
+        task,
+        process,
+        samples=[
+            TaskSample(sample_id="s1", input={"language": "python", "diff": ""}),
+            TaskSample(sample_id="s2", input={"language": "python", "diff": ""}),
+        ],
+        objects=FileObjectStore(source / "outputs"),
+        workspace_source=source,
+    )
+
+    assert seen == [["main.py"], ["main.py"]]
+
+
+def test_config_digest_covers_the_watchdog_and_the_opencode_executable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ZAI_API_KEY", RUN_KEY)
+    task = load_task(ROOT / "examples/tasks/code-review.yaml")
+    executables = []
+    for version in ("1", "2"):
+        executable = tmp_path / f"opencode-{version}"
+        executable.write_text(f"#!/bin/sh\necho {version}\n")
+        executable.chmod(0o755)
+        executables.append(str(executable))
+
+    def digest(**kwargs: object) -> str:
+        execution = _run(tmp_path, task, lambda **_: _completed(), **kwargs)
+        objects = FileObjectStore(tmp_path / "objects")
+        return json.loads(objects.get_bytes(execution.manifest.records[0].key))["config_digest"]
+
+    baseline = digest(executable=executables[0], timeout_seconds=10)
+    assert digest(executable=executables[0], timeout_seconds=20) != baseline
+    assert digest(executable=executables[1], timeout_seconds=10) != baseline
+    assert digest(executable=executables[0], timeout_seconds=10) == baseline
+
+
+@pytest.mark.parametrize(
+    ("evaluator", "message"),
+    [
+        ({"kind": "regex", "config": {}}, "config.pattern"),
+        ({"kind": "regex", "config": {"pattern": "("}}, "config.pattern"),
+        ({"kind": "latency_budget", "config": {"max_latency_ms": "fast"}}, "max_latency_ms"),
+        ({"kind": "json_schema", "config": {"schema": {"type": 5}}}, "schema"),
+    ],
+)
+def test_malformed_evaluators_fail_before_credentials_or_model_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, evaluator: dict, message: str
+) -> None:
+    monkeypatch.delenv("ZAI_API_KEY", raising=False)
+    monkeypatch.delenv("ZAI_API_KEY_FILE", raising=False)
+    payload = load_task(ROOT / "examples/tasks/code-review.yaml").model_dump(mode="json")
+    payload["evaluators"] = [
+        {"evaluator_id": "broken", "version": "1.0.0", "required": False, **evaluator}
+    ]
+    task = TaskDefinition.model_validate(payload)
+
+    def never_run(**_: object) -> OpenCodeProcessResult:
+        raise AssertionError("OpenCode must not start with a malformed evaluator")
+
+    with pytest.raises(ValueError, match=message):
+        _run(tmp_path, task, never_run)
+
+
+def test_workspace_snapshot_covers_file_modes_and_symlinks(tmp_path: Path) -> None:
+    from agent_benchmark_lab.harnesses.opencode.workspace import (
+        snapshot_workspace,
+        workspace_changes,
+    )
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    script = workspace / "run.sh"
+    script.write_text("echo hi\n")
+    script.chmod(0o644)
+    (workspace / "link").symlink_to("run.sh")
+    before = snapshot_workspace(workspace)
+
+    script.chmod(0o755)
+    (workspace / "link").unlink()
+    (workspace / "link").symlink_to("missing-target")
+    objects = FileObjectStore(tmp_path / "objects")
+    changes = {
+        change.path: change
+        for change in workspace_changes(workspace=workspace, before=before, objects=objects)
+    }
+
+    assert changes["run.sh"].status == "modified"
+    assert changes["run.sh"].after_mode == "100755"
+    assert changes["link"].status == "modified"
+    assert changes["link"].after_mode == "120000"
+    assert changes["link"].after_ref is not None
+    assert objects.get_bytes(changes["link"].after_ref.removeprefix("object://")) == (
+        b"missing-target"
+    )
+
+
+def test_opencode_spans_carry_the_source_event_timing() -> None:
+    _, parsed = sanitize_and_parse_jsonl(
+        _jsonl(
+            {"type": "step_start", "timestamp": 1000, "part": {}},
+            {
+                "type": "tool_use",
+                "timestamp": 1450,
+                "part": {
+                    "tool": "bash",
+                    "state": {"status": "completed", "time": {"start": 1100, "end": 1400}},
+                },
+            },
+            {"type": "step_finish", "timestamp": 1600, "part": {"tokens": {"input": 1}}},
+        )
+    )
+    exporter = InMemorySpanExporter()
+    telemetry = create_telemetry(TelemetrySettings(), span_exporter=exporter)
+    with telemetry.run(experiment_id="timing-test") as run:
+        emit_opencode_spans(run, parsed, model_name="glm-5.2")
+    telemetry.close()
+
+    spans = {span.name: dict(span.attributes or {}) for span in exporter.get_finished_spans()}
+    model = spans["opencode.model_generation"]
+    tool = spans["opencode.tool.bash"]
+    assert (model["agenttrace.source.start_unix_ms"], model["agenttrace.source.end_unix_ms"]) == (
+        1000,
+        1600,
+    )
+    assert model["agenttrace.source.duration_ms"] == 600
+    assert (tool["agenttrace.source.start_unix_ms"], tool["agenttrace.source.end_unix_ms"]) == (
+        1100,
+        1400,
+    )
+    assert tool["agenttrace.source.duration_ms"] == 300
+
+
+def test_record_commits_to_the_scored_answer_as_well_as_the_redacted_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import hashlib
+
+    monkeypatch.setenv("ZAI_API_KEY", RUN_KEY)
+    payload = load_task(ROOT / "examples/tasks/code-review.yaml").model_dump(mode="json")
+    payload["data_policy"]["redaction_mode"] = "strict"
+    task = TaskDefinition.model_validate(payload)
+    answer = "unsafe YAML deserialization; report to owner@example.test"
+
+    execution = _run(tmp_path, task, lambda **_: _completed(answer))
+    objects = FileObjectStore(tmp_path / "objects")
+    record = json.loads(objects.get_bytes(execution.manifest.records[0].key))
+
+    assert record["scored_output_sha256"] == hashlib.sha256(answer.encode()).hexdigest()
+    assert record["scored_output_bytes"] == len(answer.encode())
+    assert record["scored_output_sha256"] != record["output_sha256"]
+    stored = b"\n".join(objects.get_bytes(key) for key in objects.list_keys())
+    assert b"owner@example.test" not in stored
+
+
+def test_run_opencode_kills_background_children_after_a_clean_exit(tmp_path: Path) -> None:
+    import os
+    import time
+
+    marker = tmp_path / "child.pid"
+    script = tmp_path / "fake-opencode"
+    script.write_text(f"#!/bin/sh\nsleep 30 >/dev/null 2>&1 &\necho $! > {marker}\nexit 0\n")
+    script.chmod(0o755)
+    config = tmp_path / "opencode.json"
+    config.write_text("{}")
+
+    result = run_opencode(
+        executable=str(script),
+        workspace=tmp_path,
+        config_path=config,
+        runtime_root=tmp_path / "runtime",
+        model="glm-5.2",
+        reasoning_effort=ZAIReasoningEffort.MAX,
+        sample_id="s1",
+        timeout_seconds=10,
+    )
+
+    assert result.exit_code == 0
+    child = int(marker.read_text())
+    for _ in range(100):
+        try:
+            os.kill(child, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        os.kill(child, 9)
+        pytest.fail("a background child outlived its OpenCode process")

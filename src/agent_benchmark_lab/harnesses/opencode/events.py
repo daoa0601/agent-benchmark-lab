@@ -21,6 +21,9 @@ class OpenCodeToolEvent(BaseModel):
     input: JsonValue = None
     output: JsonValue = None
     status: str | None = None
+    # OpenCode's own execution times (Unix milliseconds); spans are emitted after the process exits.
+    started_ms: int | None = Field(default=None, ge=0)
+    ended_ms: int | None = Field(default=None, ge=0)
 
 
 class OpenCodeModelEvent(BaseModel):
@@ -35,6 +38,8 @@ class OpenCodeModelEvent(BaseModel):
     reasoning_tokens: int = Field(default=0, ge=0)
     cost_usd: float | None = Field(default=None, ge=0)
     output: str | None = None
+    started_ms: int | None = Field(default=None, ge=0)
+    ended_ms: int | None = Field(default=None, ge=0)
 
 
 @dataclass(frozen=True)
@@ -54,6 +59,21 @@ def _integer(value: object) -> int:
     return (
         int(value) if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
     )
+
+
+def _millis(value: object) -> int | None:
+    if isinstance(value, int | float) and not isinstance(value, bool) and value >= 0:
+        return int(value)
+    return None
+
+
+def _event_millis(
+    payload: dict[str, JsonValue], part: dict[str, JsonValue], bound: str
+) -> int | None:
+    """An event's time: its part's ``time.<bound>``, else the event's own ``timestamp``."""
+    raw_time = part.get("time")
+    time = raw_time if isinstance(raw_time, dict) else {}
+    return _millis(time.get(bound)) if bound in time else _millis(payload.get("timestamp"))
 
 
 def _number(value: object) -> float | None:
@@ -141,6 +161,7 @@ def sanitize_and_parse_jsonl(
     steps: list[list[int]] = []
     current_step: list[int] = []
     step_opened = 0
+    step_opened_ms: int | None = None
     step_is_open = False
     for sequence, payload in enumerate(payloads):
         event_type = str(payload.get("type") or "")
@@ -149,6 +170,8 @@ def sanitize_and_parse_jsonl(
         if event_type == "tool_use":
             raw_state = part.get("state")
             state = raw_state if isinstance(raw_state, dict) else {}
+            raw_time = state.get("time")
+            time = raw_time if isinstance(raw_time, dict) else {}
             tools.append(
                 OpenCodeToolEvent(
                     sequence=sequence,
@@ -156,6 +179,8 @@ def sanitize_and_parse_jsonl(
                     input=cast(JsonValue, state.get("input")),
                     output=cast(JsonValue, state.get("output")),
                     status=str(state.get("status")) if state.get("status") is not None else None,
+                    started_ms=_millis(time.get("start")),
+                    ended_ms=_millis(time.get("end")),
                 )
             )
         normalized = str(event_type or part.get("type") or "").replace("-", "_")
@@ -166,6 +191,7 @@ def sanitize_and_parse_jsonl(
             current_step = []
             step_is_open = True
             step_opened = sequence
+            step_opened_ms = _event_millis(payload, part, "start")
         if event_type == "text":
             text = part.get("text")
             if isinstance(text, str) and text.strip():
@@ -187,9 +213,12 @@ def sanitize_and_parse_jsonl(
                     cached_input_tokens=_integer(cache.get("read")),
                     reasoning_tokens=_integer(tokens.get("reasoning")),
                     cost_usd=_number(part.get("cost")),
+                    started_ms=step_opened_ms,
+                    ended_ms=_event_millis(payload, part, "end"),
                 )
             )
             step_opened = sequence + 1
+            step_opened_ms = None
     if current_step or step_is_open:
         steps.append(current_step)
     answer_sequences = steps[-1] if steps else []
@@ -236,6 +265,18 @@ def emit_opencode_spans(run: AgentRun, events: ParsedOpenCodeEvents, *, model_na
             _emit_tool_span(run, event)
 
 
+def _timing(started_ms: int | None, ended_ms: int | None) -> dict[str, int]:
+    """OpenCode's recorded execution time; the span's own clock only measures the replay."""
+    timing: dict[str, int] = {}
+    if started_ms is not None:
+        timing["agenttrace.source.start_unix_ms"] = started_ms
+    if ended_ms is not None:
+        timing["agenttrace.source.end_unix_ms"] = ended_ms
+    if started_ms is not None and ended_ms is not None and ended_ms >= started_ms:
+        timing["agenttrace.source.duration_ms"] = ended_ms - started_ms
+    return timing
+
+
 def _emit_model_span(run: AgentRun, model: OpenCodeModelEvent, *, model_name: str) -> None:
     with run.span(
         "opencode.model_generation",
@@ -246,6 +287,7 @@ def _emit_model_span(run: AgentRun, model: OpenCodeModelEvent, *, model_name: st
             "gen_ai.provider.name": "zai",
             "gen_ai.request.model": model_name,
             "agenttrace.transport": "opencode",
+            **_timing(model.started_ms, model.ended_ms),
         },
     ) as result:
         result.output = model.output or {"event_sequence": model.sequence}
@@ -265,6 +307,7 @@ def _emit_tool_span(run: AgentRun, tool: OpenCodeToolEvent) -> None:
         attributes={
             "tool.name": tool.name,
             "agenttrace.opencode.event_sequence": tool.sequence,
+            **_timing(tool.started_ms, tool.ended_ms),
         },
     ) as result:
         result.output = tool.output

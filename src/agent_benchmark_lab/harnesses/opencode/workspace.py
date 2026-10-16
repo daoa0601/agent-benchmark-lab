@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
+import stat
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -36,6 +37,9 @@ class WorkspaceChange(BaseModel):
     after_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     after_ref: str | None = None
     after_bytes: int | None = Field(default=None, ge=0)
+    # Git-style entry mode: 100644 file, 100755 executable file, 120000 symlink (content is the
+    # link target, never what it points to).
+    after_mode: str | None = Field(default=None, pattern=r"^(100644|100755|120000)$")
 
 
 @dataclass(frozen=True)
@@ -47,10 +51,6 @@ class IsolatedWorkspace:
 
 def _excluded(name: str) -> bool:
     return name in EXCLUDED_NAMES or name.startswith(".env.")
-
-
-def _ignore(_: str, names: list[str]) -> set[str]:
-    return {name for name in names if _excluded(name)}
 
 
 def _validate_symlinks(source: Path) -> None:
@@ -69,8 +69,22 @@ def _validate_symlinks(source: Path) -> None:
 
 
 @contextmanager
-def isolated_workspace(source: Path | None) -> Iterator[IsolatedWorkspace]:
-    """Copy a source tree without VCS, local agent config, or common secret files."""
+def isolated_workspace(
+    source: Path | None, *, exclude: tuple[Path, ...] = ()
+) -> Iterator[IsolatedWorkspace]:
+    """Copy a source tree without VCS, local agent config, or common secret files.
+
+    ``exclude`` names directories, such as an output root inside the source, left out entirely.
+    """
+    excluded_paths = {path.expanduser().resolve() for path in exclude}
+
+    def ignore(directory: str, names: list[str]) -> set[str]:
+        return {
+            name
+            for name in names
+            if _excluded(name) or (Path(directory) / name).resolve() in excluded_paths
+        }
+
     with TemporaryDirectory(prefix="agenttrace-opencode-workspace-") as temp_dir:
         root = Path(temp_dir)
         workspace = root / "workspace"
@@ -86,7 +100,7 @@ def isolated_workspace(source: Path | None) -> Iterator[IsolatedWorkspace]:
                 resolved_source,
                 workspace,
                 symlinks=True,
-                ignore=_ignore,
+                ignore=ignore,
             )
         yield IsolatedWorkspace(
             path=workspace,
@@ -105,27 +119,43 @@ def _sha256(path: Path) -> tuple[str, int]:
     return digest.hexdigest(), size
 
 
-def snapshot_workspace(workspace: Path) -> dict[str, tuple[str, int]]:
-    snapshot: dict[str, tuple[str, int]] = {}
+Snapshot = dict[str, tuple[str, int, str]]
+"""Relative path to (SHA-256, byte count, Git-style mode) of every file and symlink."""
+
+
+def _entry(path: Path) -> tuple[str, int, str] | None:
+    if path.is_symlink():
+        target = os.readlink(path).encode("utf-8", "surrogateescape")
+        return hashlib.sha256(target).hexdigest(), len(target), "120000"
+    metadata = path.stat()
+    if not stat.S_ISREG(metadata.st_mode):
+        return None
+    digest, size = _sha256(path)
+    return digest, size, "100755" if metadata.st_mode & 0o111 else "100644"
+
+
+def snapshot_workspace(workspace: Path) -> Snapshot:
+    snapshot: Snapshot = {}
     for root, directories, files in os.walk(workspace, followlinks=False):
+        # A symlinked directory is recorded as a link and never descended into.
+        linked = [name for name in directories if (Path(root) / name).is_symlink()]
         directories[:] = sorted(
-            name
-            for name in directories
-            if not _excluded(name) and not (Path(root) / name).is_symlink()
+            name for name in directories if not _excluded(name) and name not in linked
         )
-        for name in sorted(files):
+        for name in sorted([*files, *linked]):
             if _excluded(name):
                 continue
             path = Path(root) / name
-            if path.is_file() and not path.is_symlink():
-                snapshot[path.relative_to(workspace).as_posix()] = _sha256(path)
+            entry = _entry(path)
+            if entry is not None:
+                snapshot[path.relative_to(workspace).as_posix()] = entry
     return snapshot
 
 
 def workspace_changes(
     *,
     workspace: Path,
-    before: dict[str, tuple[str, int]],
+    before: Snapshot,
     objects: ObjectStore,
 ) -> list[WorkspaceChange]:
     after = snapshot_workspace(workspace)
@@ -142,9 +172,15 @@ def workspace_changes(
         else:
             status = "modified"
         after_ref = None
+        mode: str | None = None
         if current is not None:
-            digest, size = current
-            content = (workspace / relative).read_bytes()
+            digest, size, mode = current
+            path = workspace / relative
+            content = (
+                os.readlink(path).encode("utf-8", "surrogateescape")
+                if mode == "120000"
+                else path.read_bytes()
+            )
             key = f"benchmarks/workspaces/sha256/{digest[:2]}/{digest}.bin"
             objects.put_bytes(key, content, if_absent=True)
             after_ref = f"object://{key}"
@@ -158,6 +194,7 @@ def workspace_changes(
                 after_sha256=digest,
                 after_ref=after_ref,
                 after_bytes=size,
+                after_mode=mode,
             )
         )
     return changes

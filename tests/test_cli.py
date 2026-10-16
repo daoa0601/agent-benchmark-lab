@@ -332,3 +332,24 @@ def test_invalid_task_file_masks_unknown_keys(
     assert "extra_forbidden" in captured.err
     assert "version: string_type" in captured.err
     assert "private-extra-key" not in captured.out + captured.err
+
+
+def test_invalid_option_values_are_not_echoed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    exit_code = main(
+        [
+            "benchmark",
+            "zai-api",
+            *SUPPORT_ARGS,
+            "--thinking-mode",
+            "private-option-value",
+            "--output-root",
+            str(tmp_path / "objects"),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert "private-option-value" not in captured.out + captured.err
+    assert "enabled" in captured.err
