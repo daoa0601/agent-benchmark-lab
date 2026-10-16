@@ -5,7 +5,7 @@ model-provider transports, records every sample as a trace and immutable evidenc
 deterministic headline gate to an audited session manifest.
 
 This checkout needs the sibling `agent-trace-platform` and `benchmark-audit-core` checkouts next to
-it; see [the catalog README](../../README.md#cross-repo-boundaries) for the layout and cross-repo
+it; see [the catalog README](https://github.com/daoa0601/agentic-orch/blob/main/README.md#cross-repo-boundaries) for the layout and cross-repo
 boundaries.
 
 ## Boundaries

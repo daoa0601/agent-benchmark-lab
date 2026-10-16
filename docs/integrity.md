@@ -21,6 +21,6 @@ Apply these rules prospectively to autonomous benchmark claims:
 that contract into the `agent-benchmark gate` workflow and supplies safe local trace and outcome
 helpers. It does not infer hidden model-gateway attempts: record the configured and resolved provider
 routes as evidence. Which layer owns retries and fallbacks is set in
-[the catalog README](../../../README.md#cross-repo-boundaries).
+[the catalog README](https://github.com/daoa0601/agentic-orch/blob/main/README.md#cross-repo-boundaries).
 
 The example manifest is synthetic documentation, never research evidence.
