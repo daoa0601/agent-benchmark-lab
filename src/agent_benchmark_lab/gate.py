@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from importlib import import_module
 from pathlib import Path
 from typing import Any
 
+from agenttrace.audits import persist_audit_bundle
+from agenttrace.storage import FileObjectStore
 from benchmark_audit_core import AuditableSession, build_audit_bundle, render_audit_report
 
 
@@ -29,20 +30,6 @@ class GateSummary:
         return asdict(self)
 
 
-def _persist_bundle(bundle: object, object_root: Path) -> str:
-    """Load AgentTrace storage only when the caller requests persistence."""
-
-    try:
-        audits = import_module("agenttrace.audits")
-        objects = import_module("agenttrace.storage.objects")
-    except ImportError as error:
-        raise RuntimeError(
-            "object-store persistence requires the sibling agenttrace-platform source"
-        ) from error
-    stored = audits.persist_audit_bundle(objects.FileObjectStore(object_root), bundle)
-    return str(stored.key)
-
-
 def gate_session(
     manifest_path: str | Path,
     *,
@@ -57,7 +44,11 @@ def gate_session(
     bundle = build_audit_bundle(session)
     report.parent.mkdir(parents=True, exist_ok=True)
     report.write_text(render_audit_report(bundle), encoding="utf-8")
-    bundle_key = _persist_bundle(bundle, Path(object_root)) if object_root is not None else None
+    bundle_key = (
+        persist_audit_bundle(FileObjectStore(Path(object_root)), bundle).key
+        if object_root is not None
+        else None
+    )
     gate = bundle.headline_gate
     return GateSummary(
         session_id=session.session_id,

@@ -2,10 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-
 from agent_benchmark_lab import gate_session
-from agent_benchmark_lab.gate import _persist_bundle
+from agenttrace.storage import FileObjectStore
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -23,38 +21,18 @@ def test_synthetic_example_passes_and_renders_findings(tmp_path: Path) -> None:
     assert "## Audit findings" in report.read_text(encoding="utf-8")
 
 
-def test_agenttrace_is_loaded_only_when_persistence_is_requested(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+def test_gate_persists_an_immutable_bundle_in_the_agenttrace_object_store(
+    tmp_path: Path,
 ) -> None:
-    def missing_module(name: str) -> object:
-        raise ImportError(name)
+    manifest = PROJECT_ROOT / "examples/auditable-session.example.json"
+    object_root = tmp_path / "objects"
 
-    monkeypatch.setattr("agent_benchmark_lab.gate.import_module", missing_module)
-    with pytest.raises(RuntimeError, match="agenttrace-platform"):
-        gate_session(
-            PROJECT_ROOT / "examples/auditable-session.example.json",
-            report_path=tmp_path / "audit-report.md",
-            object_root=tmp_path / "objects",
-        )
+    first = gate_session(manifest, report_path=tmp_path / "first.md", object_root=object_root)
+    second = gate_session(manifest, report_path=tmp_path / "second.md", object_root=object_root)
 
-
-def test_agenttrace_persistence_returns_the_bundle_key(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    class Stored:
-        key = "audits/bundles/example.json"
-
-    class Audits:
-        @staticmethod
-        def persist_audit_bundle(store: object, bundle: object) -> Stored:
-            return Stored()
-
-    class Objects:
-        class FileObjectStore:
-            def __init__(self, root: Path) -> None:
-                self.root = root
-
-    modules = {"agenttrace.audits": Audits, "agenttrace.storage.objects": Objects}
-    monkeypatch.setattr("agent_benchmark_lab.gate.import_module", modules.__getitem__)
-
-    assert _persist_bundle(object(), tmp_path) == "audits/bundles/example.json"
+    assert first.status == "passed"
+    assert first.bundle_key is not None
+    assert first.bundle_key.startswith("audits/bundles/")
+    assert second.bundle_key == first.bundle_key
+    assert len(list(object_root.glob("audits/bundles/*.json"))) == 1
+    assert FileObjectStore(object_root).exists(first.bundle_key)

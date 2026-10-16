@@ -1,43 +1,53 @@
 # Agent Benchmark Lab
 
-A fresh-start workbench for building auditable and reproducible agent benchmarks. It provides the
-small integration layer a research runner needs without inheriting course artifacts, historic result
-directories, cluster scripts, or unrelated experiment code.
+A workbench for running and gating auditable, reproducible agent benchmarks. It runs tasks through
+model-provider transports, records every sample as a trace and immutable evidence, and applies the
+deterministic headline gate to an audited session manifest.
 
-The repository is source-only and begins at `0.1.0`. It is consumed from a sibling checkout; no
-PyPI publication is required.
+This checkout needs the sibling `agent-trace-platform` and `benchmark-audit-core` checkouts next to
+it; see [the catalog README](https://github.com/daoa0601/agentic-orch/blob/main/README.md#cross-repo-boundaries) for the layout and cross-repo
+boundaries.
 
 ## Boundaries
 
-- `benchmark-audit-core` owns portable evidence models, canonical digests, audit bundles, and
-  deterministic headline gates.
-- Agent Benchmark Lab owns safe trace capture, outcome semantics, evidence-description commands,
-  and the workflow that applies the core gate to one experiment manifest.
-- `agent-trace-platform` optionally persists an immutable audit bundle. It remains the owner of
-  telemetry and object storage.
-- A research repository owns its task runner, datasets, provider policy, prompts, and scientific
-  claims.
+- This repository owns the benchmark runners (Z.AI general API and the isolated OpenCode Coding Plan
+  harness), safe local trace capture, outcome semantics, evidence-description commands, and the
+  single `agent-benchmark gate` CLI.
+- Task contracts, telemetry, redaction rules, and immutable object storage come from AgentTrace's
+  public Python API (`agenttrace.tasks`, `agenttrace.integrations`, `agenttrace.redaction`,
+  `agenttrace.storage`, `agenttrace.audits`).
+- Audit schemas and the gate decision come from `benchmark_audit_core`.
+- A research repository owns its own task data, provider policy, prompts, and scientific claims.
 
 ## Checkout and verify
-
-Place this repository beside its shared dependencies:
-
-```text
-agentic-orch/
-├── agent-benchmark-lab/
-├── agent-trace-platform/
-└── benchmark-audit-core/
-```
-
-Then run:
 
 ```bash
 uv sync --extra dev
 make check
-make build
 ```
 
-## Workbench commands
+There is no hosted CI. The `agent-trace-platform` sibling is private, and a workflow token can't
+read another private repository, so `make check` run locally is the gate for every change.
+
+## Run benchmarks
+
+Run the bundled support-routing example through the Z.AI general API:
+
+```bash
+export ZAI_API_KEY='...'
+uv run agent-benchmark benchmark zai-api \
+  examples/tasks/support-routing.yaml \
+  examples/tasks/support-routing.samples.jsonl \
+  --metadata-only \
+  --otlp-endpoint http://localhost:4318
+```
+
+`agent-benchmark benchmark zai-opencode` runs Coding Plan sessions through an isolated OpenCode
+process, and `agent-benchmark provider zai-smoke --endpoint-plan general` checks connectivity. Both
+transports, their credential boundaries, and their retained evidence are described in
+[model benchmarking](docs/model-benchmarking.md).
+
+## Describe evidence and gate a claim
 
 Describe an artifact by digest without copying or printing its contents:
 
@@ -51,19 +61,18 @@ complete an independent review, and gate the claim:
 
 ```bash
 uv run agent-benchmark gate runs/example/session.json \
-  --report runs/example/audit-report.md
+  --report runs/example/audit-report.md \
+  --object-root runs/object-store
 ```
 
-Exit code `0` means the headline gate passed, `2` means a valid session was blocked, and `1` means
-the input or integration was invalid. Add `--object-root runs/object-store` only when the optional
-AgentTrace dependency is installed.
+Exit code `0` means the headline gate passed or did not apply, `2` means a valid session was blocked,
+and `1` means the input was invalid. `--object-root` is optional; with it, the content-addressed
+audit bundle is written to that AgentTrace object store without overwriting an existing bundle.
 
 Use `JsonlTraceSink` for a bounded append-only local trace and `summarize_outcomes` to keep harness
 submission separate from a judge-confirmed resolution. See [the integrity protocol](docs/integrity.md)
 and [the provenance note](UPSTREAM.md).
 
-## Versioning and privacy
+## Privacy
 
-Tags use semantic versioning. `v0.1.0` establishes the workbench API; incompatible contract changes
-remain possible until `1.0.0`. Raw traces, run outputs, `.env` files, and credentials are ignored and
-must stay outside Git. The GitHub repository remains private until a separate public-readiness review.
+Raw traces, run outputs, `.env` files, and credentials are ignored and must stay outside Git.

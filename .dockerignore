@@ -1,0 +1,13 @@
+.git
+.venv
+__pycache__
+.pytest_cache
+.ruff_cache
+.coverage
+data
+outputs
+runs
+secrets
+tests
+.DS_Store
+.env

@@ -1,0 +1,47 @@
+# General-API Z.AI smoke test exporting OTLP to a running AgentTrace stack.
+# Start AgentTrace first (`docker compose up -d` in ../agent-trace-platform), then:
+#   docker compose -f compose.zai.yaml --profile live run --build --rm zai-smoke
+name: agent-benchmark-lab
+
+services:
+  zai-smoke:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      additional_contexts:
+        agent-trace-platform: ../agent-trace-platform
+        benchmark-audit-core: ../benchmark-audit-core
+    profiles: [live]
+    command:
+      - provider
+      - zai-smoke
+      - --endpoint-plan
+      - general
+      - --model
+      - "${ZAI_MODEL:-glm-5.2}"
+      - --thinking-mode
+      - "${ZAI_THINKING_MODE:-disabled}"
+      - --reasoning-effort
+      - "${ZAI_REASONING_EFFORT:-max}"
+      - --otlp-endpoint
+      - http://otel-collector:4318
+    environment:
+      ZAI_API_KEY_FILE: /run/secrets/zai_api_key
+    secrets:
+      - zai_api_key
+    networks: [agenttrace]
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,noexec,nosuid
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+
+networks:
+  agenttrace:
+    external: true
+    name: agenttrace_default
+
+secrets:
+  zai_api_key:
+    file: "${ZAI_API_KEY_FILE_HOST:-./secrets/zai_api_key}"

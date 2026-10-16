@@ -5,20 +5,23 @@ build-backend = "uv_build"
 [project]
 name = "agent-benchmark-lab"
 version = "0.1.1"
-description = "Fresh-start workbench for auditable and reproducible agent benchmarks"
+description = "Run and gate auditable, reproducible agent benchmarks"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
 authors = [{ name = "Anh Dao" }]
 dependencies = [
+  "agenttrace-platform>=0.1,<0.2",
   "benchmark-audit-core>=0.1,<0.2",
+  "httpx>=0.28,<1",
+  "jsonschema>=4.23,<5",
+  "pydantic>=2.10,<3",
+  "pydantic-settings>=2.7,<3",
+  "typer>=0.15,<1",
 ]
 
 [project.optional-dependencies]
-telemetry = [
-  "agenttrace-platform>=0.1,<0.2",
-]
 dev = [
   "basedpyright>=1.28,<2",
   "pytest>=8.3,<10",
@@ -27,8 +30,8 @@ dev = [
 ]
 
 [tool.uv.sources]
-benchmark-audit-core = { path = "../benchmark-audit-core", editable = true }
 agenttrace-platform = { path = "../agent-trace-platform", editable = true }
+benchmark-audit-core = { path = "../benchmark-audit-core", editable = true }
 
 [project.scripts]
 agent-benchmark = "agent_benchmark_lab.cli:main"
@@ -46,9 +49,10 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["B", "E", "F", "I", "N", "UP"]
+ignore = ["B008"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["agent_benchmark_lab", "benchmark_audit_core"]
+known-first-party = ["agent_benchmark_lab", "agenttrace", "benchmark_audit_core"]
 
 [tool.basedpyright]
 pythonVersion = "3.11"
