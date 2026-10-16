@@ -183,3 +183,27 @@ def test_zai_smoke_cli_rejects_coding_plan_and_never_prints_content(monkeypatch)
     payload = json.loads(result.output)
     assert payload["ok"] is True
     assert payload["content_printed"] is False
+
+
+def test_zai_base_url_override_cannot_cross_endpoint_plans() -> None:
+    with pytest.raises(ValidationError, match="endpoint_plan=general"):
+        _settings(endpoint_plan=ZAIEndpointPlan.GENERAL, base_url=CODING_PLAN_API_BASE)
+    with pytest.raises(ValidationError, match="endpoint_plan=coding"):
+        _settings(endpoint_plan=ZAIEndpointPlan.CODING, base_url=GENERAL_API_BASE)
+    assert (
+        _settings(endpoint_plan=ZAIEndpointPlan.GENERAL, base_url=GENERAL_API_BASE).base_url
+        == GENERAL_API_BASE
+    )
+
+
+@pytest.mark.parametrize("payload", [[], "text", 3])
+def test_zai_client_rejects_non_object_success_payloads(payload: object) -> None:
+    client = ZAIClient(
+        _settings(),
+        http_client=httpx.Client(
+            transport=httpx.MockTransport(lambda _: httpx.Response(200, json=payload))
+        ),
+    )
+    with pytest.raises(ZAIProviderError, match="invalid chat-completions payload"):
+        client.complete([{"role": "user", "content": "hi"}])
+    client.close()

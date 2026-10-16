@@ -6,6 +6,7 @@ import json
 import secrets
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -29,6 +30,12 @@ class BrokerRequest:
     response_bytes: int
     thinking_mode: str
     reasoning_effort: str
+    completed: bool = True
+    """False when the forward was still running when the session closed its evidence."""
+
+
+class BrokerDrainedError(RuntimeError):
+    """A request arrived after the broker stopped admitting upstream forwards."""
 
 
 class CodingPlanCredentialBroker:
@@ -63,8 +70,13 @@ class CodingPlanCredentialBroker:
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
+        self._idle = threading.Condition(self._lock)
         self._requests: list[BrokerRequest] = []
         self._claimed_requests = 0
+        # sequence -> (perf_counter start, request bytes) for forwards not yet recorded.
+        self._in_flight: dict[int, tuple[float, int]] = {}
+        self._abandoned: set[int] = set()
+        self._admitting = True
 
     @property
     def base_url(self) -> str:
@@ -78,13 +90,20 @@ class CodingPlanCredentialBroker:
         with self._lock:
             return tuple(sorted(self._requests, key=lambda request: request.sequence))
 
-    def _claim_request(self) -> int | None:
-        """Atomically reserve one upstream request slot and its stable sequence number."""
+    def _claim_request(self, *, started: float, request_bytes: int) -> int | None:
+        """Atomically reserve one upstream request slot and its stable sequence number.
+
+        Raises ``BrokerDrainedError`` once draining has begun, so a handler that was still
+        reading its body cannot start billable work after the evidence was returned.
+        """
         with self._lock:
+            if not self._admitting:
+                raise BrokerDrainedError
             if self._claimed_requests >= self.max_requests:
                 return None
             sequence = self._claimed_requests
             self._claimed_requests += 1
+            self._in_flight[sequence] = (started, request_bytes)
             return sequence
 
     def _append_request(
@@ -98,7 +117,11 @@ class CodingPlanCredentialBroker:
         thinking_mode: str,
         reasoning_effort: str,
     ) -> None:
-        with self._lock:
+        with self._idle:
+            self._in_flight.pop(sequence, None)
+            self._idle.notify_all()
+            if sequence in self._abandoned:
+                return
             self._requests.append(
                 BrokerRequest(
                     sequence=sequence,
@@ -162,7 +185,11 @@ class CodingPlanCredentialBroker:
                     ensure_ascii=False,
                     separators=(",", ":"),
                 ).encode("utf-8")
-                sequence = broker._claim_request()
+                try:
+                    sequence = broker._claim_request(started=started, request_bytes=len(body))
+                except BrokerDrainedError:
+                    self._reply(lambda: self._json_error(503, "broker session has ended"))
+                    return
                 if sequence is None:
                     self._json_error(429, "session model-call limit reached")
                     return
@@ -182,7 +209,7 @@ class CodingPlanCredentialBroker:
                     status_code = upstream.status_code
                     content_type = upstream.headers.get("Content-Type", "application/json")
                 except httpx.HTTPError:
-                    self._json_error(502, "upstream model request failed")
+                    # Record before replying: the agent may already be gone.
                     broker._append_request(
                         sequence=sequence,
                         status_code=502,
@@ -192,12 +219,10 @@ class CodingPlanCredentialBroker:
                         thinking_mode=ZAIThinkingMode.ENABLED.value,
                         reasoning_effort=broker.reasoning_effort.value,
                     )
+                    self._reply(lambda: self._json_error(502, "upstream model request failed"))
                     return
-                self.send_response(status_code)
-                self.send_header("Content-Type", content_type)
-                self.send_header("Content-Length", str(len(response_body)))
-                self.end_headers()
-                self.wfile.write(response_body)
+                # The upstream call is finished billable work whether or not the agent is still
+                # connected to receive it, so account for it before delivering the response.
                 broker._append_request(
                     sequence=sequence,
                     status_code=status_code,
@@ -208,7 +233,55 @@ class CodingPlanCredentialBroker:
                     reasoning_effort=broker.reasoning_effort.value,
                 )
 
+                def deliver() -> None:
+                    self.send_response(status_code)
+                    self.send_header("Content-Type", content_type)
+                    self.send_header("Content-Length", str(len(response_body)))
+                    self.end_headers()
+                    self.wfile.write(response_body)
+
+                self._reply(deliver)
+
+            def _reply(self, send: Callable[[], None]) -> None:
+                """Deliver a response, tolerating an agent that already disconnected."""
+                try:
+                    send()
+                except (BrokenPipeError, ConnectionResetError):
+                    self.close_connection = True
+
         return Handler
+
+    def drain(self, timeout_seconds: float | None = None) -> tuple[BrokerRequest, ...]:
+        """Stop accepting requests, wait for in-flight forwards, and return the final evidence.
+
+        Call this after the agent process has exited and before reading evidence: a forward that
+        started just before a watchdog kill is still billable work. Forwards still running after
+        the wait (by default the upstream timeout plus a margin) are recorded as incomplete.
+        """
+        with self._lock:
+            self._admitting = False
+        if self._server is not None:
+            self._server.shutdown()
+        wait = self.timeout_seconds + 5 if timeout_seconds is None else timeout_seconds
+        with self._idle:
+            self._idle.wait_for(lambda: not self._in_flight, timeout=wait)
+            now = time.perf_counter()
+            for sequence, (started, request_bytes) in sorted(self._in_flight.items()):
+                self._abandoned.add(sequence)
+                self._requests.append(
+                    BrokerRequest(
+                        sequence=sequence,
+                        status_code=0,
+                        latency_ms=(now - started) * 1000,
+                        request_bytes=request_bytes,
+                        response_bytes=0,
+                        thinking_mode=ZAIThinkingMode.ENABLED.value,
+                        reasoning_effort=self.reasoning_effort.value,
+                        completed=False,
+                    )
+                )
+            self._in_flight.clear()
+        return self.requests
 
     def __enter__(self) -> CodingPlanCredentialBroker:
         if self._server is not None:

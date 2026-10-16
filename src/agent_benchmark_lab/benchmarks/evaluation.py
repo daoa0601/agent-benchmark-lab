@@ -9,7 +9,14 @@ import jsonschema
 from pydantic import JsonValue
 
 from agent_benchmark_lab.benchmarks.models import BenchmarkEvaluation
-from agenttrace.tasks import EvaluatorSpec, TaskDefinition, TaskSample, parse_json_output
+from agenttrace.redaction import Redactor
+from agenttrace.tasks import (
+    EvaluatorSpec,
+    TaskDefinition,
+    TaskSample,
+    describe_schema_violation,
+    parse_json_output,
+)
 
 SUPPORTED_DIRECT_EVALUATORS = {
     "exact_match",
@@ -88,7 +95,7 @@ def evaluate_response(
             )
             continue
         if spec.kind == "exact_match":
-            actual: JsonValue = parsed if parsed is not None else output_text.strip()
+            actual: JsonValue = parsed.value if parsed is not None else output_text
             expected = _expected(spec, task, sample)
             if isinstance(actual, str) and isinstance(expected, str):
                 if bool(spec.config.get("strip", True)):
@@ -148,14 +155,14 @@ def evaluate_response(
                 )
                 continue
             try:
-                jsonschema.validate(parsed, cast(dict[str, object], schema))
+                jsonschema.validate(parsed.value, cast(dict[str, object], schema))
             except jsonschema.ValidationError as error:
                 outcomes.append(
                     _completed(
                         spec,
                         passed=False,
                         score=0.0,
-                        details={"validation_error": error.message},
+                        details=describe_schema_violation(error),
                     )
                 )
             else:
@@ -183,6 +190,14 @@ def evaluate_response(
                 )
             )
 
+    # Details can quote expected values found in the output, so they follow the task's policy.
+    redactor = Redactor(task.data_policy.redaction_mode)
+    outcomes = [
+        outcome.model_copy(
+            update={"details": cast(dict[str, JsonValue], redactor.redact(outcome.details)[0])}
+        )
+        for outcome in outcomes
+    ]
     scored = [outcome for outcome in outcomes if outcome.score is not None]
     total_weight = sum(outcome.weight for outcome in scored)
     aggregate = (

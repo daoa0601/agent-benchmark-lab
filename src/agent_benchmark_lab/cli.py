@@ -9,11 +9,12 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
+from pydantic import BaseModel, ValidationError
 
 from agent_benchmark_lab.evidence import describe_evidence
 from agent_benchmark_lab.gate import gate_session
 from agenttrace.storage import FileObjectStore
-from agenttrace.tasks import load_task
+from agenttrace.tasks import TaskDefinition, describe_validation_error, load_task
 
 app = typer.Typer(
     name="agent-benchmark",
@@ -32,6 +33,18 @@ def _invalid(error: Exception) -> typer.Exit:
 
     typer.echo(json.dumps({"status": "invalid", "error_type": type(error).__name__}), err=True)
     return typer.Exit(code=1)
+
+
+def _bad_parameter(error: ValueError, model: type[BaseModel] | None = None) -> typer.BadParameter:
+    """Report invalid input by field and rule; Pydantic's own text quotes the offending values.
+
+    ``model`` names the fields that may appear in the location; other location parts are masked.
+    """
+    if isinstance(error, ValidationError):
+        return typer.BadParameter(
+            f"{error.title}: {describe_validation_error(error, model)}",
+        )
+    return typer.BadParameter(str(error))
 
 
 @app.command()
@@ -133,18 +146,29 @@ def zai_api_benchmark(
         effort = ZAIReasoningEffort(reasoning_effort)
         task = load_task(task_path)
         samples = load_task_samples(samples_path)
-        settings_kwargs = {
-            "api_key_file": api_key_file,
-            "endpoint_plan": ZAIEndpointPlan.GENERAL,
-            "model": model,
-            "thinking_mode": thinking,
-            "reasoning_effort": effort,
-        }
-        if api_key_file is not None:
-            settings_kwargs["api_key"] = None
-        provider_settings = ZAISettings(**settings_kwargs)
     except ValueError as error:
-        raise typer.BadParameter(str(error)) from error
+        raise _bad_parameter(error, TaskDefinition) from error
+    try:
+        if api_key_file is None:
+            # Leave the key source to the environment (ZAI_API_KEY or ZAI_API_KEY_FILE).
+            provider_settings = ZAISettings(
+                endpoint_plan=ZAIEndpointPlan.GENERAL,
+                model=model,
+                thinking_mode=thinking,
+                reasoning_effort=effort,
+            )
+        else:
+            # An explicit --api-key-file wins over ZAI_API_KEY.
+            provider_settings = ZAISettings(
+                api_key=None,
+                api_key_file=api_key_file,
+                endpoint_plan=ZAIEndpointPlan.GENERAL,
+                model=model,
+                thinking_mode=thinking,
+                reasoning_effort=effort,
+            )
+    except ValueError as error:
+        raise _bad_parameter(error, ZAISettings) from error
 
     telemetry = create_telemetry(
         TelemetrySettings(
@@ -152,6 +176,7 @@ def zai_api_benchmark(
             otlp_endpoint=otlp_endpoint or "http://127.0.0.1:4318/v1/traces",
             service_name="agenttrace-zai-api-benchmark",
             capture_content=capture,
+            redaction_mode=task.data_policy.redaction_mode,
         )
     )
     try:
@@ -288,7 +313,7 @@ def zai_opencode_benchmark(
         else:
             timeout = watchdog_seconds or None
     except ValueError as error:
-        raise typer.BadParameter(str(error)) from error
+        raise _bad_parameter(error, TaskDefinition) from error
     telemetry = create_telemetry(
         TelemetrySettings(
             telemetry_enabled=otlp_endpoint is not None,
@@ -408,7 +433,7 @@ def zai_smoke(
         thinking = ZAIThinkingMode(thinking_mode)
         effort = ZAIReasoningEffort(reasoning_effort)
     except ValueError as error:
-        raise typer.BadParameter(str(error)) from error
+        raise _bad_parameter(error) from error
     if plan == ZAIEndpointPlan.CODING:
         raise typer.BadParameter(
             "custom SDK calls cannot use the Coding Plan; use the supported OpenCode harness"

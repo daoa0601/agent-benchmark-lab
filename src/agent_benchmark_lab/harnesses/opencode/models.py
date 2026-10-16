@@ -28,6 +28,7 @@ class BrokerRequestEvidence(StrictModel):
     reasoning_effort: Literal["max", "xhigh", "high", "medium", "low", "minimal", "none"] | None = (
         None
     )
+    completed: bool = True
 
     @classmethod
     def from_request(cls, request: BrokerRequest) -> BrokerRequestEvidence:

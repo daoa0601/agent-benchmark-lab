@@ -109,6 +109,11 @@ def run_opencode_benchmark(
         raise ValueError("samples cannot be empty")
     if max_model_calls < 1:
         raise ValueError("max_model_calls must be positive")
+    if task.environment.kind.value != "none":
+        raise ValueError(
+            "the OpenCode harness runs in a local isolated workspace and cannot provision "
+            f"environment.kind={task.environment.kind.value}; use environment.kind=none"
+        )
     effective_small_model = small_model or model
     credential = credential_source.resolve()
     real_key = credential.get_secret_value()
@@ -208,6 +213,7 @@ def run_opencode_benchmark(
                                 sample_id=sample.sample_id,
                                 timeout_seconds=timeout_seconds,
                             )
+                            broker_requests = broker.drain()
                             sanitized_stdout, parsed = sanitize_and_parse_jsonl(
                                 process.stdout,
                                 known_secrets=(real_key, broker.client_token),
@@ -218,7 +224,7 @@ def run_opencode_benchmark(
                                 "exit_code": process.exit_code,
                                 "timed_out": process.timed_out,
                                 "event_count": parsed.event_count,
-                                "model_call_count": len(broker.requests),
+                                "model_call_count": len(broker_requests),
                                 "tool_call_count": len(parsed.tools),
                             }
                         if process.exit_code != 0 or process.timed_out:
@@ -238,7 +244,7 @@ def run_opencode_benchmark(
                                     ).hexdigest(),
                                     "stderr_bytes": len(process.stderr.encode("utf-8")),
                                 }
-                        for request in broker.requests:
+                        for request in broker_requests:
                             with run.span(
                                 "credential_broker.forward",
                                 step_type="agent_state",
@@ -252,13 +258,16 @@ def run_opencode_benchmark(
                                     "agenttrace.provider.reasoning_effort": (
                                         request.reasoning_effort
                                     ),
+                                    "agenttrace.broker.completed": request.completed,
                                 },
                             ) as broker_result:
                                 broker_result.output = {"latency_ms": request.latency_ms}
+                                if not request.completed:
+                                    broker_result.error_type = "forward_incomplete"
                         outcomes, aggregate, required_passed = evaluate_response(
                             task,
                             sample,
-                            parsed.final_text,
+                            parsed.answer_text,
                             latency_ms=process.elapsed_seconds * 1000,
                         )
                         for outcome in outcomes:
@@ -283,7 +292,6 @@ def run_opencode_benchmark(
                             },
                         ) as final_result:
                             final_result.output = parsed.final_text
-                    broker_requests = tuple(broker.requests)
                 changes = workspace_changes(
                     workspace=workspace.path,
                     before=before,

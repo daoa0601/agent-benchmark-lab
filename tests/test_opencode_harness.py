@@ -3,15 +3,21 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 import httpx
 import pytest
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import StatusCode
 from pydantic import SecretStr
 
 from agent_benchmark_lab.harnesses.opencode import ZAICredentialSource, run_opencode_benchmark
 from agent_benchmark_lab.harnesses.opencode.config import build_opencode_config
+from agent_benchmark_lab.harnesses.opencode.events import (
+    emit_opencode_spans,
+    sanitize_and_parse_jsonl,
+)
 from agent_benchmark_lab.harnesses.opencode.models import OpenCodeBenchmarkRecord
 from agent_benchmark_lab.harnesses.opencode.process import (
     OpenCodeProcessResult,
@@ -23,7 +29,7 @@ from agent_benchmark_lab.harnesses.opencode.workspace import isolated_workspace
 from agent_benchmark_lab.providers.zai import ZAIReasoningEffort
 from agenttrace.integrations import CaptureMode, TelemetrySettings, create_telemetry
 from agenttrace.storage import FileObjectStore
-from agenttrace.tasks import TaskSample, load_task
+from agenttrace.tasks import TaskDefinition, TaskSample, load_task
 
 
 def test_credential_source_and_child_environment_never_mix_secrets(
@@ -303,3 +309,253 @@ def test_workspace_rejects_symlinks_that_escape_source(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="symlink"):
         with isolated_workspace(source):
             pass
+
+
+def _jsonl(*events: dict) -> str:
+    return "\n".join(json.dumps(event) for event in events)
+
+
+def test_only_the_terminal_step_text_is_the_answer() -> None:
+    _, parsed = sanitize_and_parse_jsonl(
+        _jsonl(
+            {"type": "step_start", "part": {}},
+            {"type": "text", "part": {"text": "Let me read main.py first."}},
+            {"type": "tool_use", "part": {"tool": "read", "state": {"status": "completed"}}},
+            {"type": "step_finish", "part": {"tokens": {"input": 1, "output": 1}}},
+            {"type": "step_start", "part": {}},
+            {"type": "text", "part": {"text": "unsafe YAML deserialization"}},
+            {"type": "step_finish", "part": {"tokens": {"input": 1, "output": 1}}},
+        )
+    )
+
+    assert parsed.final_text == "unsafe YAML deserialization"
+    assert parsed.answer_text == "unsafe YAML deserialization"
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        # The final step only ran tools.
+        [
+            {"type": "step_start", "part": {}},
+            {"type": "tool_use", "part": {"tool": "read", "state": {"status": "completed"}}},
+            {"type": "step_finish", "part": {"tokens": {"input": 1, "output": 1}}},
+        ],
+        # The agent was interrupted after opening its final step.
+        [{"type": "step_start", "part": {}}],
+    ],
+)
+def test_earlier_narration_is_never_promoted_to_the_answer(tail: list[dict[str, object]]) -> None:
+    _, parsed = sanitize_and_parse_jsonl(
+        _jsonl(
+            {"type": "step_start", "part": {}},
+            {"type": "text", "part": {"text": "unsafe YAML deserialization"}},
+            {"type": "step_finish", "part": {"tokens": {"input": 1, "output": 1}}},
+            *tail,
+        )
+    )
+
+    assert parsed.answer_text == ""
+    assert parsed.final_text == ""
+
+
+def test_strict_redaction_applies_to_evidence_but_not_to_the_scored_answer() -> None:
+    encoded, parsed = sanitize_and_parse_jsonl(
+        _jsonl({"type": "text", "part": {"text": "Escalate to billing@example.com"}}),
+        known_secrets=("real-provider-secret",),
+        redaction_mode="strict",
+    )
+
+    assert "billing@example.com" not in parsed.final_text
+    assert b"billing@example.com" not in encoded
+    assert parsed.answer_text == "Escalate to billing@example.com"
+
+
+def test_opencode_spans_follow_event_order_and_mark_failed_tools() -> None:
+    _, parsed = sanitize_and_parse_jsonl(
+        _jsonl(
+            {"type": "step_start", "part": {}},
+            {"type": "tool_use", "part": {"tool": "bash", "state": {"status": "error"}}},
+            {"type": "step_finish", "part": {"tokens": {"input": 1, "output": 1}}},
+            {"type": "step_start", "part": {}},
+            {"type": "tool_use", "part": {"tool": "edit", "state": {"status": "completed"}}},
+            {"type": "step_finish", "part": {"tokens": {"input": 2, "output": 2}}},
+            # A step without an explicit start opens right after the previous step finished.
+            {"type": "tool_use", "part": {"tool": "read", "state": {"status": "completed"}}},
+            {"type": "step_finish", "part": {"tokens": {"input": 3, "output": 3}}},
+        )
+    )
+    exporter = InMemorySpanExporter()
+    telemetry = create_telemetry(TelemetrySettings(), span_exporter=exporter)
+    with telemetry.run(experiment_id="order-test") as run:
+        emit_opencode_spans(run, parsed, model_name="glm-5.2")
+    telemetry.close()
+
+    spans = [span for span in exporter.get_finished_spans() if span.name.startswith("opencode.")]
+    assert [span.name for span in spans] == [
+        "opencode.model_generation",
+        "opencode.tool.bash",
+        "opencode.model_generation",
+        "opencode.tool.edit",
+        "opencode.model_generation",
+        "opencode.tool.read",
+    ]
+    tokens = [
+        (span.attributes or {}).get("llm.token_count.prompt")
+        for span in spans
+        if "model" in span.name
+    ]
+    assert tokens == [1, 2, 3]
+    assert spans[1].status.status_code == StatusCode.ERROR
+    assert spans[3].status.status_code == StatusCode.OK
+
+
+def test_broker_drain_waits_for_in_flight_forwards_and_records_stragglers() -> None:
+    release = threading.Event()
+    entered = threading.Event()
+
+    def slow_upstream(_: httpx.Request) -> httpx.Response:
+        entered.set()
+        release.wait(timeout=10)
+        return httpx.Response(200, json={"choices": []})
+
+    client = httpx.Client(transport=httpx.MockTransport(slow_upstream))
+    responses: list[int] = []
+    with CodingPlanCredentialBroker(
+        api_key=SecretStr("real-provider-secret"), model="glm-5.2", http_client=client
+    ) as broker:
+
+        def call() -> None:
+            response = httpx.post(
+                f"{broker.base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {broker.client_token}"},
+                json={"model": "glm-5.2", "messages": []},
+                timeout=10,
+            )
+            responses.append(response.status_code)
+
+        caller = threading.Thread(target=call)
+        caller.start()
+        assert entered.wait(timeout=5)
+        abandoned = broker.drain(timeout_seconds=0.05)
+        assert [(request.completed, request.status_code) for request in abandoned] == [(False, 0)]
+        assert abandoned[0].request_bytes > 0
+
+        release.set()
+        caller.join(timeout=5)
+        assert broker.requests == abandoned
+    client.close()
+    assert responses == [200]
+
+    quick = httpx.Client(transport=httpx.MockTransport(lambda _: httpx.Response(200, json={})))
+    with CodingPlanCredentialBroker(
+        api_key=SecretStr("real-provider-secret"), model="glm-5.2", http_client=quick
+    ) as broker:
+        httpx.post(
+            f"{broker.base_url}/chat/completions",
+            headers={"Authorization": f"Bearer {broker.client_token}"},
+            json={"model": "glm-5.2", "messages": []},
+            timeout=5,
+        )
+        drained = broker.drain()
+    quick.close()
+    assert [(request.completed, request.status_code) for request in drained] == [(True, 200)]
+
+
+def test_opencode_runner_rejects_environments_it_cannot_provision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ZAI_API_KEY", "real-coding-secret-123456")
+    root = Path(__file__).resolve().parents[1]
+    task = load_task(root / "examples/tasks/code-review.yaml")
+    payload = task.model_dump(mode="json")
+    payload["environment"] = {"kind": "docker", "image": "sandbox:latest"}
+    docker_task = TaskDefinition.model_validate(payload)
+
+    def never_run(**_: object) -> OpenCodeProcessResult:
+        raise AssertionError("OpenCode must not start for an unsupported environment")
+
+    with pytest.raises(ValueError, match="environment.kind=docker"):
+        run_opencode_benchmark(
+            task=docker_task,
+            samples=[TaskSample(sample_id="s1", input={"language": "python", "diff": ""})],
+            credential_source=ZAICredentialSource(),
+            telemetry=create_telemetry(TelemetrySettings(telemetry_enabled=False)),
+            objects=FileObjectStore(tmp_path / "objects"),
+            experiment_id="env-test",
+            process_runner=never_run,
+        )
+
+
+def test_broker_accounts_for_a_forward_whose_agent_disconnected() -> None:
+    import socket
+    import threading
+    import time
+
+    forwarding = threading.Event()
+
+    def slow_upstream(_: httpx.Request) -> httpx.Response:
+        forwarding.set()
+        time.sleep(0.3)
+        return httpx.Response(200, json={"choices": []})
+
+    client = httpx.Client(transport=httpx.MockTransport(slow_upstream))
+    with CodingPlanCredentialBroker(
+        api_key=SecretStr("real-provider-secret"), model="glm-5.2", http_client=client
+    ) as broker:
+        host, port = broker.base_url.removeprefix("http://").split(":")
+        body = json.dumps({"model": "glm-5.2", "messages": []}).encode()
+        with socket.create_connection((host, int(port))) as connection:
+            connection.sendall(
+                b"POST /chat/completions HTTP/1.1\r\nHost: x\r\n"
+                + f"Authorization: Bearer {broker.client_token}\r\n".encode()
+                + f"Content-Length: {len(body)}\r\n\r\n".encode()
+                + body
+            )
+            assert forwarding.wait(timeout=5)
+        started = time.perf_counter()
+        drained = broker.drain(timeout_seconds=5)
+        assert time.perf_counter() - started < 3
+    client.close()
+    assert [(request.completed, request.status_code) for request in drained] == [(True, 200)]
+
+
+def test_broker_rejects_a_request_whose_body_arrives_after_drain() -> None:
+    import socket
+    import time
+
+    upstream_calls: list[httpx.Request] = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        upstream_calls.append(request)
+        return httpx.Response(200, json={"choices": []})
+
+    client = httpx.Client(transport=httpx.MockTransport(upstream))
+    with CodingPlanCredentialBroker(
+        api_key=SecretStr("real-provider-secret"), model="glm-5.2", http_client=client
+    ) as broker:
+        host, port = broker.base_url.removeprefix("http://").split(":")
+        body = json.dumps({"model": "glm-5.2", "messages": []}).encode()
+        connection = socket.create_connection((host, int(port)))
+        connection.sendall(
+            b"POST /chat/completions HTTP/1.1\r\nHost: x\r\n"
+            + f"Authorization: Bearer {broker.client_token}\r\n".encode()
+            + f"Content-Length: {len(body)}\r\n\r\n".encode()
+            + body[:5]
+        )
+        # Usually lets the handler start reading the body; the assertions hold either way.
+        time.sleep(0.05)
+        drained = broker.drain(timeout_seconds=1)
+        connection.sendall(body[5:])
+    # The listener is closed now: an accepted handler answers 503, a still-queued one is reset.
+    connection.settimeout(5)
+    try:
+        reply = connection.recv(4096)
+    except ConnectionResetError:
+        reply = b""
+    finally:
+        connection.close()
+    client.close()
+    assert drained == ()
+    assert upstream_calls == []
+    assert reply == b"" or reply.split(b" ", 2)[1] == b"503"

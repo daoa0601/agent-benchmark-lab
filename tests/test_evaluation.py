@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
@@ -116,3 +117,67 @@ def test_json_schema_evaluator_requires_a_schema(support_task) -> None:
     )
     with pytest.raises(ValueError, match="requires a schema"):
         evaluate_response(task, _sample(), "{}", latency_ms=1.0)
+
+
+def test_json_null_output_is_validated_rather_than_treated_as_unparseable(support_task) -> None:
+    task = _task(
+        support_task,
+        {"evaluator_id": "schema", "kind": "json_schema", "config": {"schema": {"type": "null"}}},
+    )
+
+    outcomes, _, _ = evaluate_response(task, _sample(), "null", latency_ms=1.0)
+
+    assert outcomes[0].passed is True
+
+
+def test_exact_match_respects_strip_false_for_plain_text(support_task) -> None:
+    task = _task(
+        support_task,
+        {
+            "evaluator_id": "answer",
+            "kind": "exact_match",
+            "config": {"expected": "billing", "strip": False},
+        },
+    )
+
+    padded, _, _ = evaluate_response(task, _sample(), "  billing  ", latency_ms=1.0)
+    exact, _, _ = evaluate_response(task, _sample(), "billing", latency_ms=1.0)
+
+    assert padded[0].passed is False
+    assert exact[0].passed is True
+
+
+def test_json_schema_failure_details_never_copy_response_content(support_task) -> None:
+    task = _task(support_task, {"evaluator_id": "schema", "kind": "json_schema"})
+
+    outcomes, _, _ = evaluate_response(
+        task,
+        _sample(),
+        '{"intent": "x", "urgency": "private-response-value", "route": "y"}',
+        latency_ms=1.0,
+    )
+
+    assert outcomes[0].passed is False
+    assert outcomes[0].details["validator"] == "enum"
+    assert "private-response-value" not in json.dumps(outcomes[0].details)
+
+
+def test_evaluation_details_follow_the_task_redaction_mode(support_task) -> None:
+    contains = {
+        "evaluator_id": "contact",
+        "kind": "contains",
+        "config": {"values": ["alice@example.com"]},
+    }
+    output = "Escalate to alice@example.com"
+    policy = support_task.data_policy.model_dump(mode="json")
+
+    strict = _task(support_task, contains, data_policy={**policy, "redaction_mode": "strict"})
+    outcomes, _, required_passed = evaluate_response(strict, _sample(), output, latency_ms=1.0)
+    assert outcomes[0].passed is True
+    assert required_passed is True
+    assert "alice@example.com" not in json.dumps(outcomes[0].details)
+    assert outcomes[0].details["expected_count"] == 1
+
+    balanced = _task(support_task, contains, data_policy={**policy, "redaction_mode": "balanced"})
+    outcomes, _, _ = evaluate_response(balanced, _sample(), output, latency_ms=1.0)
+    assert outcomes[0].details["matched"] == ["alice@example.com"]

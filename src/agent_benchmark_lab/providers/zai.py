@@ -83,6 +83,29 @@ class ZAISettings(BaseSettings):
             raise ValueError("set only one of ZAI_API_KEY or ZAI_API_KEY_FILE")
         return self
 
+    @model_validator(mode="after")
+    def validate_base_url_matches_plan(self) -> ZAISettings:
+        """Keep a Z.AI override on the selected billing plan.
+
+        Without this, endpoint_plan=general with ZAI_BASE_URL pointing at the Coding Plan would
+        send Coding Plan traffic through the custom SDK path that the plan forbids.
+        """
+        if self.base_url is None:
+            return self
+        host = urlparse(self.base_url).hostname or ""
+        if host == "z.ai" or host.endswith(".z.ai"):
+            expected = (
+                CODING_PLAN_API_BASE
+                if self.endpoint_plan == ZAIEndpointPlan.CODING
+                else GENERAL_API_BASE
+            )
+            if self.base_url != expected:
+                raise ValueError(
+                    f"ZAI_BASE_URL on z.ai must be {expected} for "
+                    f"endpoint_plan={self.endpoint_plan.value}"
+                )
+        return self
+
     @property
     def resolved_base_url(self) -> str:
         if self.base_url:
@@ -280,6 +303,8 @@ class ZAIClient:
         request_id = response.headers.get("x-request-id") or response.headers.get("request-id")
         try:
             payload = response.json()
+            if not isinstance(payload, dict):
+                raise TypeError("chat-completions payload is not a JSON object")
             payload_request_id = payload.get("request_id") or payload.get("id")
             if request_id is None and isinstance(payload_request_id, str):
                 request_id = payload_request_id
