@@ -628,6 +628,22 @@ def test_later_samples_start_from_the_same_source_snapshot(
     assert seen == [["main.py"], ["main.py"]]
 
 
+def test_opencode_version_probe_inherits_no_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from agent_benchmark_lab.harnesses.opencode.runner import opencode_identity
+
+    monkeypatch.setenv("ZAI_API_KEY", RUN_KEY)
+    executable = tmp_path / "opencode"
+    executable.write_text('#!/bin/sh\necho "v1 key=${ZAI_API_KEY:-none} cwd=$(ls | wc -l)"\n')
+    executable.chmod(0o755)
+
+    version = opencode_identity(str(executable))["version"]
+
+    assert version is not None and RUN_KEY not in version
+    assert "key=none" in version
+
+
 def test_config_digest_covers_the_watchdog_and_the_opencode_executable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -747,7 +763,7 @@ def test_opencode_spans_carry_the_source_event_timing() -> None:
     assert tool["agenttrace.source.duration_ms"] == 300
 
 
-def test_record_commits_to_the_scored_answer_as_well_as_the_redacted_output(
+def test_record_marks_a_redacted_scored_answer_without_hashing_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import hashlib
@@ -762,11 +778,15 @@ def test_record_commits_to_the_scored_answer_as_well_as_the_redacted_output(
     objects = FileObjectStore(tmp_path / "objects")
     record = json.loads(objects.get_bytes(execution.manifest.records[0].key))
 
-    assert record["scored_output_sha256"] == hashlib.sha256(answer.encode()).hexdigest()
+    assert record["scored_output_redacted"] is True
     assert record["scored_output_bytes"] == len(answer.encode())
-    assert record["scored_output_sha256"] != record["output_sha256"]
     stored = b"\n".join(objects.get_bytes(key) for key in objects.list_keys())
     assert b"owner@example.test" not in stored
+    assert hashlib.sha256(answer.encode()).hexdigest().encode() not in stored
+
+    clean = _run(tmp_path, task, lambda **_: _completed("unsafe YAML deserialization"))
+    clean_record = json.loads(objects.get_bytes(clean.manifest.records[0].key))
+    assert clean_record["scored_output_redacted"] is False
 
 
 def test_run_opencode_kills_background_children_after_a_clean_exit(tmp_path: Path) -> None:

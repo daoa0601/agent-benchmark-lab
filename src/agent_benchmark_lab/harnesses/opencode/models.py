@@ -76,8 +76,10 @@ class OpenCodeBenchmarkRecord(StrictModel):
     output_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     output_bytes: int | None = Field(default=None, ge=0)
     output_ref: str | None = None
-    # The evaluators score the answer before redaction; this commits to it without retaining it.
-    scored_output_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    # Evaluators score the answer before redaction. When redaction changed it, the scored text is
+    # deliberately not retained or hashed (an unkeyed digest of a short redacted value can be
+    # brute-forced); otherwise ``output_sha256`` already commits to exactly what was scored.
+    scored_output_redacted: bool | None = None
     scored_output_bytes: int | None = Field(default=None, ge=0)
     broker_requests: list[BrokerRequestEvidence]
     workspace_changes: list[WorkspaceChange]

@@ -38,7 +38,11 @@ from agent_benchmark_lab.harnesses.opencode.models import (
     OpenCodeBenchmarkSummary,
     OpenCodeRecordRef,
 )
-from agent_benchmark_lab.harnesses.opencode.process import OpenCodeProcessResult, run_opencode
+from agent_benchmark_lab.harnesses.opencode.process import (
+    OpenCodeProcessResult,
+    isolated_child_environment,
+    run_opencode,
+)
 from agent_benchmark_lab.harnesses.opencode.proxy import CodingPlanCredentialBroker
 from agent_benchmark_lab.harnesses.opencode.workspace import (
     isolated_workspace,
@@ -85,12 +89,21 @@ def opencode_identity(executable: str) -> dict[str, str | None]:
         return {"sha256": None, "version": None}
     path = Path(resolved).resolve()
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
-    try:
-        reported = subprocess.run(
-            [str(path), "--version"], capture_output=True, text=True, timeout=10, check=False
-        ).stdout.strip()
-    except (OSError, subprocess.TimeoutExpired):
-        reported = ""
+    # Probed with the run's isolation: no inherited credentials, no project directory.
+    with TemporaryDirectory(prefix="agenttrace-opencode-version-") as probe_dir:
+        probe = Path(probe_dir)
+        try:
+            reported = subprocess.run(
+                [str(path), "--version"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+                cwd=probe,
+                env=isolated_child_environment(probe / "runtime"),
+            ).stdout.strip()
+        except (OSError, subprocess.TimeoutExpired):
+            reported = ""
     return {"sha256": digest, "version": reported.splitlines()[0][:128] if reported else None}
 
 
@@ -455,7 +468,7 @@ def _run_samples(
             output_sha256=output_sha256,
             output_bytes=len(final_output),
             output_ref=output_ref,
-            scored_output_sha256=hashlib.sha256(scored_output).hexdigest(),
+            scored_output_redacted=scored_output != final_output,
             scored_output_bytes=len(scored_output),
             broker_requests=[
                 BrokerRequestEvidence.from_request(request) for request in broker_requests
