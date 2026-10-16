@@ -26,6 +26,9 @@ uv sync --extra dev
 make check
 ```
 
+There is no hosted CI. The `agent-trace-platform` sibling is private, and a workflow token can't
+read another private repository, so `make check` run locally is the gate for every change.
+
 ## Run benchmarks
 
 Run the bundled support-routing example through the Z.AI general API:
