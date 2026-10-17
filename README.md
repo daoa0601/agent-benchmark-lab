@@ -26,8 +26,8 @@ uv sync --extra dev
 make check
 ```
 
-There is no hosted CI. The `agent-trace-platform` sibling is private, and a workflow token can't
-read another private repository, so `make check` run locally is the gate for every change.
+CI runs the same `make check` with `agent-trace-platform` and `benchmark-audit-core` checked out
+next to this repository at their default branches.
 
 ## Run benchmarks
 
