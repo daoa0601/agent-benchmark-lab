@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Overrides .python-version for every uv call, so checks run on the minimum (and Docker) Python.
+    env:
+      UV_PYTHON: "3.11"
+    defaults:
+      run:
+        working-directory: agent-benchmark-lab
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: agent-benchmark-lab
+          persist-credentials: false
+      # uv.lock resolves these siblings as ../<name>; use their default branches.
+      - uses: actions/checkout@v4
+        with:
+          repository: daoa0601/agent-trace-platform
+          path: agent-trace-platform
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: daoa0601/benchmark-audit-core
+          path: benchmark-audit-core
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: agent-benchmark-lab/uv.lock
+      - run: uv python install 3.11
+      - run: uv sync --extra dev --locked
+      - run: make check
